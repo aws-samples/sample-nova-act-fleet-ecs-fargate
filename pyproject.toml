@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nova-act-fleet"
+version = "0.2.0"
+description = "Reference implementation for Amazon Nova Act browser-automation fleets on Amazon ECS Fargate, without Amazon Bedrock AgentCore Browser."
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT-0"}
+
+dependencies = [
+    "pydantic>=2.0,<3.0",
+    "boto3>=1.34.0,<2.0",
+    # Nova Act uses a four-part version (major.minor.build.patch); pinning to
+    # >=3.4,<4 tracks the tested 3.4.x line and blocks a future major bump.
+    "nova-act>=3.4,<4",
+    "python-dotenv>=1.0.0,<2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "hypothesis",
+    "pytest",
+    "pytest-cov",
+    "moto",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.hypothesis]
+max_examples = 100

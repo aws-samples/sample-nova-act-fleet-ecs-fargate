@@ -1,0 +1,613 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Nova Act UI Automation - ECS Fargate Deployment Pattern.
+  Deploys a VPC with public/private subnets, NAT Gateway, ECS Fargate cluster,
+  task definition (4 vCPU, 8 GB RAM) for Chromium-capable browser automation,
+  ECR repository, and supporting IAM roles with least-privilege policies.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: nova-act
+    Description: Environment name used as prefix for resource naming.
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for the VPC.
+
+  PublicSubnetCidr:
+    Type: String
+    Default: 10.0.1.0/24
+    Description: CIDR block for the public subnet.
+
+  PrivateSubnetCidr:
+    Type: String
+    Default: 10.0.2.0/24
+    Description: CIDR block for the private subnet.
+
+  S3ArtifactBucketName:
+    Type: String
+    Description: Name of the S3 bucket for storing execution artifacts (screenshots, extracted data, error reports).
+
+  NovaActApiKeySecretArn:
+    Type: String
+    Description: ARN of the Secrets Manager secret containing the Nova Act API key.
+
+  ContainerImageTag:
+    Type: String
+    Default: v1
+    Description: >
+      Image tag the workflow-agent task definition pulls from ECR. Because the
+      ECR repository is created with ImageTagMutability=IMMUTABLE, a tag can
+      only be pushed once. Bump this value on each deploy (v1, v2, or a git
+      short SHA).
+    Description: Docker image tag to deploy for the workflow agent container.
+
+  DesiredTaskCount:
+    Type: Number
+    Default: 0
+    Description: Number of ECS tasks to run (0 for on-demand execution via RunTask).
+    MinValue: 0
+
+  HITLNotificationEmail:
+    Type: String
+    Default: ''
+    Description: >
+      Optional email address to subscribe to the HITL escalation SNS topic.
+      Leave empty to skip creating a subscription (you can subscribe endpoints
+      out-of-band later). If set, an email confirmation is sent on stack create;
+      the subscription is inactive until confirmed.
+
+  AlarmSuccessRateThreshold:
+    Type: Number
+    Default: 90
+    MinValue: 0
+    MaxValue: 100
+    Description: >
+      Percent threshold for the TaskSuccessRate CloudWatch alarm.
+      The alarm fires when the average success rate drops below this value
+      over AlarmEvaluationPeriodSeconds.
+
+  AlarmEvaluationPeriodSeconds:
+    Type: Number
+    Default: 900
+    MinValue: 60
+    Description: >
+      Evaluation window (in seconds) for the TaskSuccessRate alarm.
+      Must be a multiple of 60. Default 900 = 15 minutes.
+
+Conditions:
+  CreateHITLEmailSubscription: !Not [!Equals [!Ref HITLNotificationEmail, '']]
+
+Resources:
+  # ============================================================
+  # VPC and Networking
+  # ============================================================
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-vpc'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-igw'
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  # --- Public Subnet (hosts NAT Gateway) ---
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-public-subnet'
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-public-rt'
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # --- NAT Gateway ---
+  NatGatewayEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-nat-eip'
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-nat-gw'
+
+  # --- Private Subnet (hosts ECS Fargate tasks) ---
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-private-subnet'
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-private-rt'
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ============================================================
+  # Security Group
+  # ============================================================
+  ECSTaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Nova Act ECS Fargate tasks - allows outbound HTTPS only
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Allow outbound HTTPS to Nova Act Service and AWS APIs
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-ecs-task-sg'
+
+  # ============================================================
+  # ECR Repository
+  # ============================================================
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: !Sub '${EnvironmentName}-workflow-agent'
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      # Immutable tags prevent silent overwrite of a pushed image — the pushed
+      # digest for a tag is what the task definition will keep pulling. Bump
+      # ContainerImageTag on each deploy rather than reusing the same tag.
+      ImageTagMutability: IMMUTABLE
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 10 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ============================================================
+  # ECS Cluster
+  # ============================================================
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${EnvironmentName}-cluster'
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ============================================================
+  # CloudWatch Log Group
+  # ============================================================
+  ECSTaskLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub '/ecs/${EnvironmentName}-workflow-agent'
+      RetentionInDays: 90
+
+  # ============================================================
+  # SNS Topic - HITL escalations and CloudWatch alarm notifications
+  # ============================================================
+  # Fed by two paths:
+  #   1. HITLManager.escalate() publishes here when a task exhausts retries.
+  #   2. TaskSuccessRateAlarm publishes here when fleet-wide success drops
+  #      below AlarmSuccessRateThreshold.
+  # Subscribe email, SQS, Lambda, or Chatbot endpoints as needed.
+  HITLTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${EnvironmentName}-hitl-escalations'
+      DisplayName: !Sub '${EnvironmentName} HITL Escalations'
+      # Server-side encryption at rest with the AWS-managed KMS key for SNS.
+      # HITL messages carry the task prompt, which may reference internal URLs
+      # or business context. To use a customer-managed CMK instead, replace
+      # this value with the CMK ARN and grant the ECS task role
+      # kms:GenerateDataKey* and kms:Decrypt on that key.
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Component
+          Value: hitl
+
+  HITLTopicEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateHITLEmailSubscription
+    Properties:
+      TopicArn: !Ref HITLTopic
+      Protocol: email
+      Endpoint: !Ref HITLNotificationEmail
+
+  # Deny non-TLS publish to the HITL topic (defense-in-depth). Legitimate
+  # publishers (ECS tasks via boto3, CloudWatch alarm actions) all use HTTPS
+  # by default, so this policy is a guardrail, not a runtime constraint.
+  HITLTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref HITLTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 'sns:Publish'
+            Resource: !Ref HITLTopic
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # ============================================================
+  # CloudWatch Alarm - fleet-wide task success rate
+  # ============================================================
+  TaskSuccessRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-TaskSuccessRate-Low'
+      AlarmDescription: !Sub >
+        Fires when the average TaskSuccessRate metric drops below
+        ${AlarmSuccessRateThreshold}% over ${AlarmEvaluationPeriodSeconds} seconds.
+      Namespace: NovaActFleet
+      MetricName: TaskSuccessRate
+      Statistic: Average
+      Period: !Ref AlarmEvaluationPeriodSeconds
+      EvaluationPeriods: 1
+      Threshold: !Ref AlarmSuccessRateThreshold
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref HITLTopic
+      OKActions:
+        - !Ref HITLTopic
+
+  # ============================================================
+  # IAM Roles - Least Privilege
+  # ============================================================
+
+  # Task Execution Role - used by ECS agent to pull images and write logs.
+  # Scoped inline policy in place of the AmazonECSTaskExecutionRolePolicy
+  # managed policy: only the ECR repo, log group, and Secrets Manager secret
+  # this stack references are addressable.
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-ecs-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub '${EnvironmentName}-ecs-execution-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # ECR - authenticate to the registry. This action does not
+              # support resource-level restrictions, so Resource must be "*".
+              - Sid: ECRAuthorization
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              # ECR - pull the workflow-agent image from the repository this
+              # stack provisioned. Scoped to that repo only.
+              - Sid: ECRRepositoryPull
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: !GetAtt ECRRepository.Arn
+              # CloudWatch Logs - awslogs driver writes container stdout/stderr
+              # into ECSTaskLogGroup. Scoped to streams under that log group.
+              - Sid: CloudWatchLogsWrite
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${ECSTaskLogGroup}:*'
+              # Secrets Manager - retrieve Nova Act API key at container start
+              # via the ContainerDefinitions.Secrets ValueFrom reference.
+              - Sid: SecretsManagerAccess
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref NovaActApiKeySecretArn
+
+  # Task Role - used by the running container for AWS API calls
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-ecs-task-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub '${EnvironmentName}-ecs-task-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # CloudWatch Logs - write container logs
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/${EnvironmentName}-workflow-agent:*'
+
+              # S3 - read/write execution artifacts
+              - Sid: S3ArtifactAccess
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::${S3ArtifactBucketName}'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${S3ArtifactBucketName}/*'
+
+              # Secrets Manager - retrieve Nova Act API key at runtime
+              - Sid: SecretsManagerAccess
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref NovaActApiKeySecretArn
+
+              # CloudWatch Metrics - publish custom metrics
+              - Sid: CloudWatchMetrics
+                Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: NovaActFleet
+                Resource: '*'
+
+              # SNS - publish HITL escalations when retries are exhausted
+              - Sid: SNSPublishHITL
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource:
+                  - !Ref HITLTopic
+
+  # ============================================================
+  # ECS Fargate Task Definition
+  # ============================================================
+  WorkflowAgentTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${EnvironmentName}-workflow-agent'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: '4096'
+      Memory: '8192'
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: workflow-agent
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}:${ContainerImageTag}'
+          Essential: true
+          Environment:
+            - Name: S3_ARTIFACT_BUCKET
+              Value: !Ref S3ArtifactBucketName
+            - Name: ENVIRONMENT
+              Value: !Ref EnvironmentName
+            - Name: AWS_DEFAULT_REGION
+              Value: !Ref AWS::Region
+            - Name: SNS_TOPIC_ARN
+              Value: !Ref HITLTopic
+          Secrets:
+            # Pull the value at JSON key `nova-act-api-key` out of the secret.
+            # The trailing :: pins to the AWSCURRENT version stage and latest
+            # version id (the two empty fields are intentional). If you store
+            # the secret as a plain string instead of JSON, drop the
+            # `nova-act-api-key::` segment and use just !Ref NovaActApiKeySecretArn.
+            - Name: NOVA_ACT_API_KEY
+              ValueFrom: !Sub '${NovaActApiKeySecretArn}:nova-act-api-key::'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ECSTaskLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: workflow-agent
+          # Note: Fargate task definitions do not support
+          # LinuxParameters.SharedMemorySize. Chromium gets the default
+          # 64 MB /dev/shm on Fargate. For single-page browsing sessions
+          # this is sufficient. If a workload needs more (heavy paging,
+          # many tabs), inject `--disable-dev-shm-usage` into Chromium
+          # via a custom Playwright instance passed to NovaAct(...).
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Component
+          Value: workflow-agent
+
+  # ============================================================
+  # ECS Service (optional - set DesiredTaskCount to 0 for RunTask)
+  # ============================================================
+  WorkflowAgentService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub '${EnvironmentName}-workflow-agent-svc'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref WorkflowAgentTaskDefinition
+      DesiredCount: !Ref DesiredTaskCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - !Ref ECSTaskSecurityGroup
+          Subnets:
+            - !Ref PrivateSubnet
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+Outputs:
+  VpcId:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${EnvironmentName}-ecs-vpc-id'
+
+  PrivateSubnetId:
+    Description: Private subnet ID where ECS tasks run
+    Value: !Ref PrivateSubnet
+    Export:
+      Name: !Sub '${EnvironmentName}-ecs-private-subnet-id'
+
+  PublicSubnetId:
+    Description: Public subnet ID hosting the NAT Gateway
+    Value: !Ref PublicSubnet
+    Export:
+      Name: !Sub '${EnvironmentName}-ecs-public-subnet-id'
+
+  ECSClusterArn:
+    Description: ARN of the ECS cluster
+    Value: !GetAtt ECSCluster.Arn
+    Export:
+      Name: !Sub '${EnvironmentName}-ecs-cluster-arn'
+
+  ECSClusterName:
+    Description: Name of the ECS cluster
+    Value: !Ref ECSCluster
+
+  TaskDefinitionArn:
+    Description: ARN of the ECS task definition
+    Value: !Ref WorkflowAgentTaskDefinition
+    Export:
+      Name: !Sub '${EnvironmentName}-ecs-task-def-arn'
+
+  ECRRepositoryUri:
+    Description: URI of the ECR repository for the workflow agent container
+    Value: !GetAtt ECRRepository.RepositoryUri
+    Export:
+      Name: !Sub '${EnvironmentName}-ecr-repo-uri'
+
+  ECSTaskExecutionRoleArn:
+    Description: ARN of the ECS task execution IAM role
+    Value: !GetAtt ECSTaskExecutionRole.Arn
+
+  ECSTaskRoleArn:
+    Description: ARN of the ECS task IAM role
+    Value: !GetAtt ECSTaskRole.Arn
+
+  ECSTaskSecurityGroupId:
+    Description: Security group ID for ECS tasks
+    Value: !Ref ECSTaskSecurityGroup
+
+  ECSServiceName:
+    Description: Name of the ECS service
+    Value: !GetAtt WorkflowAgentService.Name
+
+  HITLTopicArn:
+    Description: ARN of the SNS topic for HITL escalations and CloudWatch alarms
+    Value: !Ref HITLTopic
+    Export:
+      Name: !Sub '${EnvironmentName}-hitl-topic-arn'
+
+  TaskSuccessRateAlarmName:
+    Description: Name of the CloudWatch alarm on TaskSuccessRate
+    Value: !Ref TaskSuccessRateAlarm

@@ -1,0 +1,30 @@
+# macOS Finder metadata
+.DS_Store
+
+# Kiro IDE workspace state (specs, hooks, session metadata)
+.kiro/
+
+# Secrets — never commit real .env, only .env.example
+.env
+.env.*
+!.env.example
+
+# Local scratch fixtures from deploy/test runs (never publish)
+.run-task-overrides*.json
+.iam-*.json
+.sqs-*.json
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Automated Security Helper (ASH) — local scan state and output directories
+.ash/
+ash-scan-output-*/
