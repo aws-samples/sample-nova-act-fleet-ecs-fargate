@@ -5,13 +5,13 @@
 # Usage:
 #   AWS_REGION=us-east-1 \
 #   AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text) \
-#   STACK_NAME=nova-act-fleet-ecs \
+#   STACK_NAME=nova-act-fleet \
 #   IMAGE_TAG=v1 \
 #   ./scripts/build_and_push.sh
 #
 # Defaults:
 #   AWS_REGION    = us-east-1
-#   STACK_NAME    = nova-act-fleet-ecs
+#   STACK_NAME    = nova-act-fleet
 #   IMAGE_TAG     = v1
 #
 # NOTE: The ECR repository is provisioned with ImageTagMutability=IMMUTABLE.
@@ -28,7 +28,7 @@
 set -euo pipefail
 
 AWS_REGION="${AWS_REGION:-us-east-1}"
-STACK_NAME="${STACK_NAME:-nova-act-fleet-ecs}"
+STACK_NAME="${STACK_NAME:-nova-act-fleet}"
 IMAGE_TAG="${IMAGE_TAG:-v1}"
 
 if [[ -z "${AWS_ACCOUNT_ID:-}" ]]; then

@@ -26,7 +26,7 @@ Prerequisites
   the CFN stack outputs::
 
       export SNS_TOPIC_ARN=$(aws cloudformation describe-stacks \\
-          --stack-name nova-act-fleet-ecs \\
+          --stack-name nova-act-fleet \\
           --query "Stacks[0].Outputs[?OutputKey=='HITLTopicArn'].OutputValue" \\
           --output text --region us-east-1)
 
@@ -91,7 +91,7 @@ def main() -> int:
         print(
             "ERROR: SNS_TOPIC_ARN is not set. Export it from your stack outputs:\n"
             "  export SNS_TOPIC_ARN=$(aws cloudformation describe-stacks \\\n"
-            "      --stack-name nova-act-fleet-ecs \\\n"
+            "      --stack-name nova-act-fleet \\\n"
             "      --query \"Stacks[0].Outputs[?OutputKey=='HITLTopicArn'].OutputValue\" \\\n"
             "      --output text --region us-east-1)"
         )

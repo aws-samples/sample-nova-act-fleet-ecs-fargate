@@ -10,7 +10,7 @@ Before deploying, ensure the following are in place:
 
 1. **AWS Account** with permissions to create VPCs, ECS clusters, IAM roles, S3 buckets, Secrets Manager secrets, ECR repositories, and CloudWatch resources.
 2. **AWS CLI v2** installed and configured (`aws configure`) with a profile that has the required permissions.
-3. **Python 3.8+** installed locally (3.12 recommended).
+3. **Python 3.10+** installed locally (3.12 recommended). The Nova Act SDK requires Python 3.10 or later.
 4. **Nova Act API key** — obtain from the Amazon Nova Act console. Two equivalent ways to store it in Secrets Manager; pick one and use it consistently.
 
    **Option 1 — JSON-wrapped (recommended; supports rotating multiple keys later):**
@@ -57,6 +57,8 @@ Before deploying, ensure the following are in place:
 
 Best for production Nova Act browser-automation workloads. Fargate tasks get 4 vCPU and 8 GB RAM — enough for Chromium-based browser automation.
 
+Cost note: Fargate charges accrue only while a task runs, and the default `DesiredTaskCount=0` runs none until you call `RunTask`. The NAT gateway (hourly plus per-GB data processing) and its Elastic IP accrue for as long as the stack exists, whether or not a task runs. Container Insights and CloudWatch Logs storage (90-day retention) are billed on usage. Delete the stack when you are not using it.
+
 Template: `templates/ecs_deployment.yaml`. Helper script: `scripts/build_and_push.sh`.
 
 ### 1. Deploy the CloudFormation stack first
@@ -66,7 +68,7 @@ The stack creates the VPC, NAT gateway, ECS cluster, ECR repository, IAM roles, 
 ```bash
 aws cloudformation deploy \
   --template-file templates/ecs_deployment.yaml \
-  --stack-name nova-act-fleet-ecs \
+  --stack-name nova-act-fleet \
   --parameter-overrides \
     EnvironmentName=nova-act-fleet \
     S3ArtifactBucketName=<your-artifact-bucket-name> \
@@ -89,7 +91,7 @@ If you pass `HITLNotificationEmail`, AWS sends a confirmation email; the subscri
 | `PublicSubnetCidr` | `10.0.1.0/24` | CIDR for the public subnet (NAT gateway) |
 | `PrivateSubnetCidr` | `10.0.2.0/24` | CIDR for the private subnet (Fargate tasks) |
 | `S3ArtifactBucketName` | — | Pre-existing S3 bucket for execution artifacts |
-| `NovaActApiKeySecretArn` | — | Pre-existing Secrets Manager ARN holding the API key as a plain string |
+| `NovaActApiKeySecretArn` | — | Pre-existing Secrets Manager ARN. The shipped task definition expects a JSON-wrapped secret with key `nova-act-api-key` (Option 1 above); a plain-string secret needs the `Secrets` edit in Option 2 |
 | `ContainerImageTag` | `v1` | Docker image tag the task definition pulls. The ECR repository is immutable, so bump this on each deploy (`v2`, `v3`, or a git short SHA) |
 | `DesiredTaskCount` | `0` | Running task count (0 = on-demand via `RunTask`) |
 | `HITLNotificationEmail` | `''` | Optional email subscribed to the HITL SNS topic. Empty = no subscription created |
@@ -109,7 +111,7 @@ If you set `HITLNotificationEmail` in step 1, an email subscription is created a
 To subscribe additional endpoints (SQS, Lambda, Chatbot, extra emails), resolve the topic ARN and use `aws sns subscribe`:
 
 ```bash
-HITL_TOPIC=$(aws cloudformation describe-stacks --stack-name nova-act-fleet-ecs \
+HITL_TOPIC=$(aws cloudformation describe-stacks --stack-name nova-act-fleet \
   --query "Stacks[0].Outputs[?OutputKey=='HITLTopicArn'].OutputValue" \
   --output text --region us-east-1)
 
@@ -129,12 +131,12 @@ The repository ships a `Dockerfile` and a `docker/entrypoint.py` that wraps `Wor
 
 ```bash
 AWS_REGION=us-east-1 \
-STACK_NAME=nova-act-fleet-ecs \
+STACK_NAME=nova-act-fleet \
 IMAGE_TAG=v1 \
 ./scripts/build_and_push.sh
 ```
 
-The script reads the ECR URI from the stack's `ECRRepositoryUri` output, runs `aws ecr get-login-password` for Docker, builds with `docker buildx build --platform linux/amd64`, and pushes. The first build pulls the Python and Playwright base layers and takes 5–10 minutes; subsequent builds are seconds because the package install layer caches.
+The script reads the ECR URI from the stack's `ECRRepositoryUri` output, runs `aws ecr get-login-password` for Docker, builds with `docker build --platform linux/amd64`, and pushes the single tag in `IMAGE_TAG`. The first build pulls the Python and Playwright base layers and takes 5–10 minutes; subsequent builds are seconds because the package install layer caches.
 
 The ECR repository is configured with `ImageTagMutability=IMMUTABLE`, so a tag can only be pushed once. Bump `IMAGE_TAG` on each rebuild (`v2`, `v3`, or use a git short SHA: `IMAGE_TAG=$(git rev-parse --short HEAD)`) and update the `ContainerImageTag` stack parameter to match.
 
@@ -143,16 +145,16 @@ The ECR repository is configured with `ImageTagMutability=IMMUTABLE`, so a tag c
 Resolve the resources you'll need from stack outputs:
 
 ```bash
-CLUSTER=$(aws cloudformation describe-stacks --stack-name nova-act-fleet-ecs \
+CLUSTER=$(aws cloudformation describe-stacks --stack-name nova-act-fleet \
   --query "Stacks[0].Outputs[?OutputKey=='ECSClusterName'].OutputValue" \
   --output text --region us-east-1)
-TASK_DEF=$(aws cloudformation describe-stacks --stack-name nova-act-fleet-ecs \
+TASK_DEF=$(aws cloudformation describe-stacks --stack-name nova-act-fleet \
   --query "Stacks[0].Outputs[?OutputKey=='TaskDefinitionArn'].OutputValue" \
   --output text --region us-east-1)
-SUBNET=$(aws cloudformation describe-stacks --stack-name nova-act-fleet-ecs \
+SUBNET=$(aws cloudformation describe-stacks --stack-name nova-act-fleet \
   --query "Stacks[0].Outputs[?OutputKey=='PrivateSubnetId'].OutputValue" \
   --output text --region us-east-1)
-SG=$(aws cloudformation describe-stacks --stack-name nova-act-fleet-ecs \
+SG=$(aws cloudformation describe-stacks --stack-name nova-act-fleet \
   --query "Stacks[0].Outputs[?OutputKey=='ECSTaskSecurityGroupId'].OutputValue" \
   --output text --region us-east-1)
 ```
@@ -179,12 +181,32 @@ aws ecs run-task \
 
 `jq -Rs .` is just there to JSON-escape the payload safely. Take the `tasks[0].taskArn` from the response — you'll need it to follow the run.
 
+`allowed_domains` must list every host the agent visits, not only the starting host: the agent re-checks each URL it reaches against the list during the session.
+
+To run a multi-step flow with one screenshot per step, send a `checkout_flow` (or `qa_test`) payload instead. The steps run in one browser session:
+
+```bash
+TASK_PAYLOAD='{
+  "task_id":         "ecs-flow-001",
+  "task_type":       "checkout_flow",
+  "starting_url":    "https://nova.amazon.com/act",
+  "allowed_domains": ["nova.amazon.com"],
+  "step_wait_seconds": 1,
+  "steps": [
+    {"step_name": "read_heading", "prompt": "Read the page heading."},
+    {"step_name": "scroll",       "prompt": "Scroll down one screen."}
+  ]
+}'
+```
+
+The `qa_test` shape is the same, with steps of the form `{"action_prompt": "...", "expected_outcome": "..."}`. Batch payloads (`"tasks": [...]`) accept single-prompt tasks only.
+
 ### 5. Validate the deployment
 
 1. Check stack status:
    ```bash
    aws cloudformation describe-stacks \
-     --stack-name nova-act-fleet-ecs \
+     --stack-name nova-act-fleet \
      --query "Stacks[0].StackStatus" \
      --region us-east-1
    ```
@@ -202,10 +224,12 @@ aws ecs run-task \
      --query "tasks[0].{status: lastStatus, stopped: stoppedReason, exit: containers[0].exitCode}"
    ```
 
-4. Check that screenshots landed in S3:
+4. Check that the audit artifacts landed in S3. A single-prompt task writes one final screenshot; a `checkout_flow` or `qa_test` task writes one screenshot per step. Every task also writes the Nova Act SDK session trace, which embeds a screenshot per SDK step:
    ```bash
-   aws s3 ls "s3://<your-artifact-bucket-name>/nova-act-artifacts/screenshots/" --region us-east-1
+   aws s3 ls "s3://<your-artifact-bucket-name>/nova-act-artifacts/screenshots/ecs-smoke-001/" --region us-east-1
+   aws s3 ls "s3://<your-artifact-bucket-name>/nova-act-artifacts/traces/ecs-smoke-001/" --recursive --region us-east-1
    ```
+   The `TaskResult` JSON lists the same keys in `screenshot_keys` and `trace_keys`. Set `CAPTURE_SCREENSHOTS=false` in the container environment to disable both.
 
 ### 6. What gets created
 
@@ -213,9 +237,10 @@ The template provisions:
 - VPC with one public and one private subnet, internet gateway, NAT gateway, EIP.
 - ECS Fargate cluster with Container Insights enabled.
 - Task definition: 4 vCPU, 8 GB RAM. Chromium runs with the default 64 MB `/dev/shm` Fargate provides; `LinuxParameters.SharedMemorySize` is not supported on Fargate.
-- ECR repository with image scanning, AES-256 encryption, mutable tags, "keep last 10 images" lifecycle policy.
+- ECR repository with image scanning, AES-256 encryption, immutable tags, "keep last 10 images" lifecycle policy.
 - Security group allowing outbound HTTPS only.
-- IAM execution role (pull images, read the configured secret) and task role (CloudWatch Logs, S3 on the configured bucket, Secrets Manager on the configured secret, scoped CloudWatch Metrics on the `NovaActFleet` namespace, `sns:Publish` on the HITL topic).
+- IAM task execution role (pull images, write logs, read the configured secret) and task role (write logs, `s3:PutObject` on the configured bucket, CloudWatch Metrics scoped to the `NovaActFleet` namespace, `sns:Publish` on the HITL topic). The task role has no Secrets Manager permission; the execution role resolves the `Secrets` block at task start.
+- A `Rules` assertion that fails stack creation outside `us-east-1`.
 - CloudWatch log group with 90-day retention.
 - SNS topic (`<EnvironmentName>-hitl-escalations`) for HITL escalations and alarm notifications, with an optional email subscription created when `HITLNotificationEmail` is set.
 - CloudWatch alarm (`<EnvironmentName>-TaskSuccessRate-Low`) on the `TaskSuccessRate` metric in the `NovaActFleet` namespace, wired to publish to the HITL topic on both breach and recovery.
@@ -261,17 +286,24 @@ aws ecs describe-tasks --cluster <cluster> --tasks <task-arn> --region us-east-1
 
 ### `aws ecs run-task --overrides` rejects with `Container Overrides length must be at most 8192`
 
-This is a hard ECS limit. For task payloads larger than ~8 KB, route them through SQS, S3, or DynamoDB and have the entrypoint dereference the location instead of inlining the payload as `TASK_PAYLOAD`. The shipped `docker/entrypoint.py` reads from `TASK_PAYLOAD` env var or stdin.
+This is a hard ECS limit. For task payloads larger than ~8 KB, store them in Amazon SQS, Amazon S3, or Amazon DynamoDB and resolve the payload to inline JSON before setting `TASK_PAYLOAD`. The shipped `docker/entrypoint.py` reads the full task or batch JSON from the `TASK_PAYLOAD` env var or stdin and does not fetch external references itself.
 
 ### ECS task starts but exits 0 with `status: failed` in the TaskResult
 
 The container ran your task, the task hit an `ActError` or `ActAgentFailed` from Nova Act, and the framework recorded a `TaskResult(status=failed)`. Exit code 0 is the entrypoint's contract: "work was attempted, see the JSON output." Inspect the JSON in CloudWatch Logs for the failure reason.
 
+### Task returns `status: rejected` with `DomainGuardrailBlocked`
+
+The agent navigated to a host outside `allowed_domains` (or inside `blocked_domains`) during the session, and the in-session guardrail stopped it. The error message names the URL. If the host is a legitimate part of the workflow (for example, a sign-in or payment provider), add it to `allowed_domains`. If it is not, the guardrail did its job; review the session trace under `traces/<task_id>/` to see what led there.
+
+### Stack creation fails with `This stack must be deployed in us-east-1`, or the container exits with a Region error
+
+Amazon Nova Act is available only in US East (N. Virginia). The template's `Rules` section blocks other Regions at stack creation, and the entry point refuses to start when `AWS_REGION` or `AWS_DEFAULT_REGION` names another Region. Redeploy with `--region us-east-1`.
+
 ### "Access Denied" when accessing S3 or Secrets Manager
 
-- Confirm the `S3ArtifactBucketName` parameter matches the actual bucket name.
-- Confirm the `NovaActApiKeySecretArn` parameter matches the actual secret ARN.
-- Verify the IAM role policies in the CloudFormation template grant access to the correct resource ARNs.
+- S3 `AccessDenied` comes from the **task role**. Confirm the `S3ArtifactBucketName` parameter matches the actual bucket name, and that the bucket policy (and any AWS KMS key policy on the bucket) allows the task role to write.
+- A Secrets Manager error at task start (`ResourceInitializationError ... unable to retrieve secret`) comes from the **task execution role**. Confirm the `NovaActApiKeySecretArn` parameter matches the actual secret ARN, and that the secret's JSON key matches the `ValueFrom` in the task definition.
 
 ### Cross-architecture builds on Apple Silicon are slow
 
@@ -279,8 +311,9 @@ The Dockerfile targets `linux/amd64` because Fargate's default is amd64. On Appl
 
 ### CloudWatch logs not appearing
 
-- Verify the log group exists (the templates create it automatically).
-- Check that the IAM role has `logs:CreateLogStream` and `logs:PutLogEvents` permissions on the correct log group ARN.
+- Verify the log group exists (the template creates it). The container does not create log groups and the task role has no `logs:CreateLogGroup` permission.
+- If you override `CLOUDWATCH_LOG_GROUP`, the task role's `logs:CreateLogStream` and `logs:PutLogEvents` grant must cover the new group.
+- Structured-log write failures are reported on the container's stderr, which the `awslogs` driver ships to the same log group under the `workflow-agent` stream prefix.
 
 ---
 
@@ -295,7 +328,7 @@ aws ecr batch-delete-image \
   --repository-name nova-act-fleet-workflow-agent \
   --image-ids imageTag=v1 \
   --region us-east-1
-aws cloudformation delete-stack --stack-name nova-act-fleet-ecs --region us-east-1
+aws cloudformation delete-stack --stack-name nova-act-fleet --region us-east-1
 ```
 
 For AgentCore Browser, this project doesn't ship infrastructure — see the [Nova Act + AgentCore Browser quickstart](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/browser-quickstart-nova-act.html) and [`why_not_agentcore.md`](why_not_agentcore.md) for context on when that path is the right one.

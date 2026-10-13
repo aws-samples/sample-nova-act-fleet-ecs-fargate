@@ -57,10 +57,10 @@ This project's job is to replicate or accept the loss of each AgentCore Browser 
 |---|---|
 | Managed Chromium lifecycle | You operate the container image (build, push, patch). |
 | Session isolation | You design the per-task ephemerality (we use a fresh `NovaAct` context per task; no shared state). |
-| Live viewing and replay | You ship per-step screenshots to S3 and rely on the SDK's local HTML session log. No real-time browser inspection. |
-| CloudTrail logging of agent actions | CloudTrail covers AWS API calls; the agent's natural-language reasoning is captured in CloudWatch Logs only. |
+| Live viewing and replay | No real-time browser inspection. After the fact, the framework uploads the SDK's per-step session trace (screenshots and reasoning) to `traces/<task_id>/` in S3, plus its own screenshots under `screenshots/<task_id>/`. |
+| CloudTrail logging of agent actions | CloudTrail covers AWS API calls; the agent's natural-language reasoning is captured in the session trace and CloudWatch Logs. |
 | AgentCore Identity (delegated credentials) | You wire credentials via Secrets Manager / SSM and rotate them yourself. |
-| Domain restrictions enforced by the runtime | Enforced by `SecurityManager.validate_domain` in application code, *before* the session opens. The rest is on you. |
+| Domain restrictions enforced by the runtime | Enforced in application code by `SecurityManager.validate_domain`: on the starting URL before the session opens, and on every observed URL during the session through the SDK `state_guardrail`. It runs in your container, so you own its configuration and its upgrades. |
 
 If those trade-offs read as "fine, we already do that for everything else we run," you're in the audience this project is for. If they read as "why would we redo all that ourselves," AgentCore Browser is the right call.
 

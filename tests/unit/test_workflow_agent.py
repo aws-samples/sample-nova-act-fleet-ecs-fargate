@@ -187,18 +187,46 @@ class TestCaptureScreenshot:
         call_args = obs.store_artifact.call_args
         assert call_args[0][0] == b"\x89PNG"  # artifact bytes
 
-    def test_returns_key_even_when_screenshot_fails(self):
+    def test_skips_upload_when_no_image_is_available(self):
+        """No active session or an empty capture uploads nothing (no 0-byte PNGs)."""
         config = _make_config()
         obs = _make_mock_observability()
         agent = WorkflowAgent(config, observability_manager=obs)
 
-        # No active session
         agent._nova = None
+        assert agent._capture_screenshot("task-1") is None
 
-        key = agent._capture_screenshot()
+        mock_nova = MagicMock()
+        mock_nova.page.screenshot.return_value = b""
+        agent._nova = mock_nova
+        assert agent._capture_screenshot("task-1") is None
 
-        # Should still store (empty bytes) and return key
-        obs.store_artifact.assert_called_once()
+        obs.store_artifact.assert_not_called()
+
+    def test_key_is_prefixed_with_task_id(self):
+        config = _make_config()
+        obs = _make_mock_observability()
+        agent = WorkflowAgent(config, observability_manager=obs)
+        mock_nova = MagicMock()
+        mock_nova.page.screenshot.return_value = b"\x89PNG"
+        agent._nova = mock_nova
+
+        agent._capture_screenshot("task-42", "final")
+
+        key = obs.store_artifact.call_args[0][1]
+        assert key == "screenshots/task-42/001-final.png"
+
+    def test_capture_disabled_uploads_nothing(self):
+        config = _make_config()
+        obs = _make_mock_observability()
+        obs.capture_screenshots = False
+        agent = WorkflowAgent(config, observability_manager=obs)
+        mock_nova = MagicMock()
+        mock_nova.page.screenshot.return_value = b"\x89PNG"
+        agent._nova = mock_nova
+
+        assert agent._capture_screenshot("task-1") is None
+        obs.store_artifact.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -340,8 +368,14 @@ class TestExecuteTask:
         with patch("nova_act_fleet.components.workflow_agent.NovaAct", return_value=mock_nova_ctx) as mock_cls:
             agent.execute_task(task)
 
-        mock_cls.assert_called_once_with(
-            starting_page="https://example.com",
-            headless=True,
-            nova_act_api_key=config.api_key,
-        )
+        mock_cls.assert_called_once()
+        kwargs = mock_cls.call_args.kwargs
+        assert kwargs["starting_page"] == "https://example.com"
+        assert kwargs["headless"] is True
+        assert kwargs["nova_act_api_key"] == config.api_key
+        assert "allowed_domains" not in kwargs
+        # In-session controls are always wired on the session factory.
+        assert callable(kwargs["state_guardrail"])
+        assert kwargs["security_options"].allowed_file_open_paths == []
+        assert kwargs["security_options"].allowed_file_upload_paths == []
+        assert "logs_directory" in kwargs

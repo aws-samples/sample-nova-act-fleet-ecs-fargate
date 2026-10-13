@@ -154,11 +154,13 @@ def main() -> None:
     headless = _env_bool("NOVA_ACT_HEADLESS", default=False)
     search_query = os.environ.get("DEMO_SEARCH_QUERY", DEFAULT_SEARCH_QUERY)
 
-    # Only the starting hostname needs to be allow-listed. The framework
-    # validates the domain once, before the NovaAct session opens (see
-    # SecurityManager.validate_domain: exact-hostname match). Once the
-    # session is running, Nova Act follows in-site navigation (search,
-    # product page, cart, sign-in) without re-checking the allowlist.
+    # Every hostname the flow visits must be allow-listed. The framework
+    # validates the starting URL before the NovaAct session opens, and the
+    # Nova Act SDK state_guardrail re-checks every URL the browser reaches
+    # during the session (SecurityManager.validate_domain: exact-hostname
+    # match). Search, product page, cart, and sign-in all stay on
+    # www.amazon.com. If a step is reported as REJECTED with
+    # DomainGuardrailBlocked, the error message names the host to review.
     config = AgentConfig(
         starting_url=AMAZON_START_URL,
         api_key=api_key,

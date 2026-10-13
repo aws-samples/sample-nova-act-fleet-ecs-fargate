@@ -11,7 +11,7 @@ The system is organized into four layers:
 - **Client Layer** — Developer scripts, CI pipelines, or Amazon API Gateway / Amazon EventBridge triggers submit task batches.
 - **Orchestration Layer** — `FleetOrchestrator` dispatches tasks to `WorkflowAgent` instances via a thread pool, aggregates results, and escalates retry-exhausted failures.
 - **Execution Layer** — `WorkflowAgent` instances run as Amazon ECS tasks on AWS Fargate, each driving a Chromium browser session through the Amazon Nova Act SDK inside your VPC.
-- **Supporting Services** — Security (six-layer defense-in-depth), Observability (Amazon CloudWatch Logs and Metrics, Amazon S3), and HITL escalation (Amazon SNS, optional Amazon DynamoDB).
+- **Supporting Services** — Security (four application-side layers and two infrastructure layers; see [`security_guide.md`](security_guide.md)), Observability (Amazon CloudWatch Logs and Metrics, Amazon S3), and HITL escalation (Amazon SNS; Amazon DynamoDB state is optional and not provisioned by the template).
 
 ```mermaid
 graph TB
@@ -21,7 +21,7 @@ graph TB
     end
 
     subgraph "Orchestration Layer"
-        FO[Fleet Orchestrator]
+        FO[Fleet Orchestrator<br/>in-container ThreadPoolExecutor]
     end
 
     subgraph "Execution Layer"
@@ -35,10 +35,10 @@ graph TB
     end
 
     subgraph "Security Layer"
-        IF[Input Filtering]
-        DR[Domain Restrictions]
-        TR[Tool Registration]
-        FAC[File Access Control]
+        IF[Input Filtering<br/>pre-flight]
+        DR[Domain Restrictions<br/>pre-flight + state_guardrail]
+        TR[Tool Surface<br/>no custom tools]
+        FAC[File Access<br/>SecurityOptions]
         VPC[VPC Isolation]
         IAM[IAM Permissions]
     end
@@ -86,9 +86,10 @@ graph LR
         SDK --> NAT
     end
     NAT --> NAS[Nova Act Service<br/>us-east-1]
-    ECS --> CW[CloudWatch Logs]
-    ECS --> S3[S3 Artifacts]
+    NAT --> AWS[AWS APIs<br/>ECR, Secrets Manager, S3,<br/>CloudWatch, SNS]
 ```
+
+The template provisions no VPC endpoints, so calls to AWS APIs also leave through the NAT gateway and incur NAT data-processing charges. Adding an Amazon S3 gateway endpoint and interface endpoints for the other services keeps that traffic off the NAT gateway; see [`security_guide.md`](security_guide.md) § Layer 5.
 
 Key characteristics:
 
@@ -96,7 +97,8 @@ Key characteristics:
 - 4 vCPU / 8 GB RAM. Chromium runs with the default 64 MB `/dev/shm` allocation that Fargate provides — `LinuxParameters.SharedMemorySize` is **not supported on Fargate** and was removed from the task definition. Single-page browsing sessions (which is what each Nova Act task is) fit comfortably in 64 MB. If a workload is heavy enough to hit the limit, override Chromium's `/dev/shm` use via a custom Playwright instance passed to `NovaAct(playwright_instance=...)`.
 - VPC-isolated with NAT Gateway for outbound access.
 - Customer-built Amazon ECR image; the template provisions the repository but does not publish a public image.
-- IAM execution role (image pull, secret read) and task role (CloudWatch Logs, S3, Secrets Manager, CloudWatch Metrics, optional SNS, optional DynamoDB) are separate, both least-privilege.
+- Single Availability Zone (`us-east-1a`): one public subnet, one private subnet, one NAT gateway. An AZ impairment stops the fleet; multi-AZ is a documented extension, not shipped.
+- IAM task execution role (image pull, log writes, secret read) and task role (log writes, `s3:PutObject` on the artifact bucket, CloudWatch metrics in the `NovaActFleet` namespace, `sns:Publish` on the HITL topic) are separate and resource-scoped. The task role has no Secrets Manager permission.
 - CloudFormation template: [`templates/ecs_deployment.yaml`](../templates/ecs_deployment.yaml).
 
 For the case for AgentCore Browser, see [`decision_matrix.md`](decision_matrix.md).
@@ -127,9 +129,7 @@ sequenceDiagram
             WA->>S3: Store artifacts
             WA->>CW: Log success
             WA-->>Pool: TaskResult(success)
-        else Failure with retries remaining
-            WA->>WA: Retry (up to max_retries)
-        else All retries exhausted
+        else Failure (retry_count >= max_retries)
             WA->>S3: Store error artifacts
             WA->>CW: Log failure
             WA-->>Pool: TaskResult(failed)
@@ -146,9 +146,9 @@ sequenceDiagram
 Behaviors enforced at each step:
 
 - Payloads exceeding 5 MB serialized JSON are rejected before dispatch.
-- Concurrency is bounded by `FleetConfig.concurrency_limit` (default 10).
+- Concurrency is bounded by `FleetConfig.concurrency_limit` (default 5).
 - Individual task failures do not halt the batch.
-- Failed tasks (after `max_retries` exhaustion) are escalated to HITL via SNS.
+- Failed tasks whose `retry_count` has reached `max_retries` are escalated to HITL via SNS. `execute_task` runs each prompt once (see the README "Framework gaps"), so set `max_retries=0` for tasks that should escalate on the first failure.
 - Batch metrics (`TaskSuccessRate`, `AverageTaskDuration`, `HITLEscalationRate`) are published to the `NovaActFleet` CloudWatch namespace.
 
 ## Component interactions
@@ -169,7 +169,10 @@ classDiagram
         +automate_form(prompt, data, retries) TaskResult
         +run_checkout_flow(flow) CheckoutResult
         +run_qa_test(test_def) QATestReport
-        -_capture_screenshot() str
+        -_session(starting_url, task_id) contextmanager
+        -_preflight(starting_url, prompts)
+        -_make_domain_guardrail(state) callable
+        -_capture_screenshot(task_id, label) str
         -_validate_domain(url) bool
         -_emit_log(event)
     }
@@ -205,7 +208,7 @@ classDiagram
 Wiring rules:
 
 - `FleetOrchestrator` constructs `WorkflowAgent`, `HITLManager`, and `ObservabilityManager` by default; production callers replace the defaults via `set_workflow_agent`, `set_hitl_manager`, and `set_observability_manager`.
-- `WorkflowAgent` accepts a `SecurityManager` and `ObservabilityManager` via constructor injection. The security manager runs *before* every Nova Act session is opened — domain validation is the gate, not the cleanup.
+- `WorkflowAgent` accepts a `SecurityManager` and `ObservabilityManager` via constructor injection. Every public method opens its Nova Act session through `_session`, which runs prompt filtering and starting-URL validation first, then opens `NovaAct` with a domain `state_guardrail`, `SecurityOptions`, and a per-task trace directory. Session state is thread-local, so one agent can be shared across the orchestrator's thread pool.
 - All AWS interactions (CloudWatch, S3, SNS, DynamoDB) go through `boto3` clients that are mockable in tests.
 
 ## What this architecture replaces from AgentCore Browser
@@ -216,11 +219,11 @@ A team coming from AgentCore Browser will recognize these features. The right co
 |---|---|
 | Managed Chromium session lifecycle | Container-managed Chromium via Playwright on ECS Fargate |
 | Session isolation | Fresh `NovaAct` context per task; no shared state across the thread pool |
-| Live viewing and replay | Per-step screenshots stored in S3 + Nova Act SDK's local HTML session log |
-| CloudTrail of agent actions | CloudTrail covers AWS API calls; the agent's reasoning is captured in CloudWatch Logs only |
-| Domain restrictions enforced by the runtime | `SecurityManager.validate_domain` runs in application code before the session opens |
-| AgentCore Identity (delegated credentials) | Secrets Manager + customer-managed IAM policies generated by `SecurityManager.get_iam_policy(pattern)` |
+| Live viewing and replay | No live view. Replay after the fact from the Nova Act SDK session trace (per-step screenshots and reasoning) uploaded to `traces/<task_id>/` in S3, plus framework screenshots under `screenshots/<task_id>/` |
+| CloudTrail of agent actions | CloudTrail covers AWS API calls; the agent's reasoning is captured in the session trace and CloudWatch Logs |
+| Domain restrictions enforced by the runtime | `SecurityManager.validate_domain`, run on the starting URL before the session opens and on every observed URL during the session through the SDK `state_guardrail` |
+| AgentCore Identity (delegated credentials) | Secrets Manager + the scoped IAM roles in `templates/ecs_deployment.yaml` |
 | Built-in scaling | `ThreadPoolExecutor` in `FleetOrchestrator` and ECS service autoscaling |
-| Built-in HITL | `HITLManager` → SNS topic + optional DynamoDB state |
+| Built-in HITL | `HITLManager` → SNS topic (optional DynamoDB state, not provisioned by the template) |
 
 This table is also reproduced in the README so readers can find the trade-off from either entry point without hunting across files.

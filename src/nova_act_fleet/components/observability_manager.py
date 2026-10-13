@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 import boto3
+from botocore.exceptions import ClientError
 
 from nova_act_fleet.models.config import ObservabilityConfig
 from nova_act_fleet.models.domain import LogEvent, MetricData
@@ -30,6 +31,11 @@ class ObservabilityManager:
         self._s3_client = boto3.client("s3")
         self._log_stream_name: Optional[str] = None
 
+    @property
+    def capture_screenshots(self) -> bool:
+        """Whether screenshots and session traces should be written to S3."""
+        return self._config.capture_screenshots
+
     def _ensure_log_stream(self) -> str:
         """Ensure a CloudWatch Logs log stream exists for the current session.
 
@@ -42,13 +48,22 @@ class ObservabilityManager:
         if self._log_stream_name is not None:
             return self._log_stream_name
 
-        # Create log group if it doesn't exist
-        try:
-            self._logs_client.create_log_group(
-                logGroupName=self._config.cloudwatch_log_group
-            )
-        except self._logs_client.exceptions.ResourceAlreadyExistsException:
-            pass
+        # Create the log group only when this process owns it. When the log
+        # group is provisioned by infrastructure as code (the shipped ECS
+        # template), the task role intentionally lacks logs:CreateLogGroup,
+        # so the call must be skipped rather than attempted and denied.
+        if self._config.create_log_group:
+            try:
+                self._logs_client.create_log_group(
+                    logGroupName=self._config.cloudwatch_log_group
+                )
+            except self._logs_client.exceptions.ResourceAlreadyExistsException:
+                pass  # Group already exists; nothing to do.
+            except ClientError as exc:
+                if exc.response.get("Error", {}).get("Code") != "AccessDeniedException":
+                    raise
+                # No CreateLogGroup permission: assume the group is managed
+                # externally and continue to stream creation.
 
         # Create a unique log stream
         stream_name = f"nova-act-fleet-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
@@ -123,17 +138,24 @@ class ObservabilityManager:
             ],
         )
 
-    def store_artifact(self, artifact: bytes, key: str, metadata: dict) -> str:
+    def store_artifact(
+        self,
+        artifact: bytes,
+        key: str,
+        metadata: dict,
+        content_type: Optional[str] = None,
+    ) -> str:
         """Upload an artifact to S3 with metadata.
 
-        Stores screenshots, extracted data, or error reports to the
-        configured S3 bucket under the configured prefix. Returns
+        Stores screenshots, session traces, extracted data, or error reports
+        to the configured S3 bucket under the configured prefix. Returns
         the full S3 key of the stored object.
 
         Args:
             artifact: The raw bytes of the artifact to store.
             key: The object key (relative to the S3 prefix).
             metadata: Arbitrary string metadata to attach to the S3 object.
+            content_type: Optional MIME type for the object.
 
         Returns:
             The full S3 key where the artifact was stored.
@@ -143,12 +165,16 @@ class ObservabilityManager:
         # Ensure all metadata values are strings for S3
         str_metadata = {str(k): str(v) for k, v in metadata.items()}
 
-        self._s3_client.put_object(
-            Bucket=self._config.s3_bucket,
-            Key=full_key,
-            Body=artifact,
-            Metadata=str_metadata,
-        )
+        put_kwargs: Dict[str, Any] = {
+            "Bucket": self._config.s3_bucket,
+            "Key": full_key,
+            "Body": artifact,
+            "Metadata": str_metadata,
+        }
+        if content_type:
+            put_kwargs["ContentType"] = content_type
+
+        self._s3_client.put_object(**put_kwargs)
 
         return full_key
 

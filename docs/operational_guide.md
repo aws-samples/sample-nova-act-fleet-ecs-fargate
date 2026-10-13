@@ -65,21 +65,23 @@ fields @timestamp, task_id, metadata.task_type, metadata.duration_seconds
 
 ### S3 Artifacts
 
-Execution artifacts (screenshots, extracted data, error reports) are stored in S3 under the configured prefix:
+Execution artifacts are stored in S3 under the configured prefix, grouped by task ID:
 
 ```
 s3://<bucket>/<prefix>/
   ├── screenshots/
-  │   └── <task_id>/<timestamp>.png
-  ├── extracted_data/
-  │   └── <task_id>/<timestamp>.json
-  └── error_reports/
-      └── <task_id>/<timestamp>.json
+  │   └── <task_id>/<NNN>-<label>.png      # e.g. 001-step0-cart_review.png, 002-final.png
+  └── traces/
+      └── <task_id>/...                     # Nova Act SDK session trace: HTML + JSON per act() call,
+                                            # with the agent's reasoning and a screenshot per SDK step
 ```
+
+`checkout_flow` and `qa_test` tasks write one screenshot per step. Single-prompt tasks write a final screenshot, plus an `-error` screenshot when a step fails. The session trace is the most complete per-step record. Structured extraction results are returned in the `TaskResult` JSON, not written to S3.
 
 Configuration defaults (from `ObservabilityConfig`):
 - **S3 prefix:** `nova-act-artifacts`
-- **Retention:** 90 days (set via `artifact_retention_days`)
+- **Capture:** on (`capture_screenshots=True`; container: `CAPTURE_SCREENSHOTS=false` disables screenshots and traces)
+- **Retention:** `artifact_retention_days` (default 90) is advisory. The framework does not create the bucket, so configure an S3 lifecycle rule on the bucket to enforce it.
 
 To list recent artifacts for a specific task:
 
@@ -94,13 +96,15 @@ aws s3 ls s3://<bucket>/nova-act-artifacts/ --recursive \
 
 ### Success Rate Alarm
 
-The `ObservabilityManager.configure_alarms()` method creates a CloudWatch alarm that fires when the task success rate drops below 90% over a 15-minute evaluation window.
+Deployments that use `templates/ecs_deployment.yaml` already have this alarm: the template creates `<EnvironmentName>-TaskSuccessRate-Low` (for example, `nova-act-fleet-TaskSuccessRate-Low`) and wires it to the HITL SNS topic for both breach and recovery. The threshold and window come from the `AlarmSuccessRateThreshold` (default 90) and `AlarmEvaluationPeriodSeconds` (default 900) parameters.
 
-Alarm details:
+For non-CloudFormation deployments, `ObservabilityManager.configure_alarms()` creates an equivalent alarm imperatively. Set `ObservabilityConfig.alarm_sns_topic_arn` to give it a notification target.
+
+Imperative alarm details:
 
 | Setting | Value |
 |---|---|
-| Alarm name | `NovaActFleet-LowSuccessRate` |
+| Alarm name | `NovaActFleet-LowSuccessRate` (`<metric_namespace>-LowSuccessRate`) |
 | Namespace | `NovaActFleet` |
 | Metric | `TaskSuccessRate` |
 | Statistic | Average |
@@ -140,7 +144,7 @@ To receive escalation alerts, subscribe to the SNS topic:
 ```bash
 # Email subscription
 aws sns subscribe \
-  --topic-arn arn:aws:sns:us-east-1:<account-id>:nova-act-fleet-hitl \
+  --topic-arn arn:aws:sns:us-east-1:<account-id>:nova-act-fleet-hitl-escalations \
   --protocol email \
   --notification-endpoint ops-team@example.com \
   --region us-east-1
@@ -149,7 +153,7 @@ aws sns subscribe \
 # function — note that this project does not ship a Lambda triage
 # function; see `docs/decision_matrix.md` for the v0.2 deployment surface)
 aws sns subscribe \
-  --topic-arn arn:aws:sns:us-east-1:<account-id>:nova-act-fleet-hitl \
+  --topic-arn arn:aws:sns:us-east-1:<account-id>:nova-act-fleet-hitl-escalations \
   --protocol lambda \
   --notification-endpoint arn:aws:lambda:us-east-1:<account-id>:function:hitl-triage \
   --region us-east-1
@@ -308,14 +312,13 @@ Amazon Nova Act is covered under **AWS Bedrock SOC 2 compliance**. This means:
 - SOC 2 reports are available through [AWS Artifact](https://aws.amazon.com/artifact/) in the AWS Management Console.
 - Coverage applies to the Nova Act Service itself. Your application code, VPC configuration, IAM policies, and data handling practices are your responsibility under the shared responsibility model.
 
-### HIPAA and PCI-DSS
+### HIPAA and PCI DSS
 
-**HIPAA and PCI-DSS compliance are not supported at launch.** Specifically:
+- Amazon Nova Act is a HIPAA Eligible Service and is included in the HIPAA Eligible Services Reference list. To process electronically protected health information (ePHI) through Workflow Agent browser sessions, execute an AWS Business Associate Addendum (BAA), designate the account as a HIPAA account, and configure the controls you are responsible for under the AWS Shared Responsibility Model (IAM access policies, AWS KMS encryption, and AWS CloudTrail logging). AWS recommends a design review with the AWS Well-Architected Tool before deploying ePHI workloads.
+- Service eligibility is not implementation readiness. This reference implementation is not HIPAA-ready as shipped; close the applicable items in `SECURITY.md` § Accepted Security Debt (customer-managed AWS KMS keys, VPC Flow Logs, AWS CloudTrail, screenshot and trace capture) before processing ePHI.
+- For PCI DSS, confirm the current status on the [AWS Services in Scope by Compliance Program](https://aws.amazon.com/compliance/services-in-scope/) page before you process, store, or transmit cardholder data through Workflow Agents.
 
-- Amazon Nova Act is **not** a HIPAA-eligible service at launch. Do not process Protected Health Information (PHI) through Workflow Agent browser sessions.
-- Amazon Nova Act is **not** PCI-DSS certified at launch. Do not use Workflow Agents to process, store, or transmit cardholder data in production payment flows.
-
-If your workloads require HIPAA or PCI-DSS compliance, wait for AWS to announce certification for these standards before deploying Nova Act in regulated environments.
+This is not legal or compliance advice; you remain responsible for meeting your specific compliance obligations.
 
 ### Staying Current
 
@@ -334,7 +337,7 @@ The framework is designed to meet the following operational targets:
 
 | Target | Value | Metric | Alarm Threshold |
 |---|---|---|---|
-| Task success rate | ≥ 90% | `TaskSuccessRate` | < 90% triggers `NovaActFleet-LowSuccessRate` alarm |
+| Task success rate | ≥ 90% | `TaskSuccessRate` | < 90% triggers the `<EnvironmentName>-TaskSuccessRate-Low` alarm |
 | HITL escalation rate | < 5% | `HITLEscalationRate` | > 5% (recommended alarm) |
 | Average task duration | < 10 minutes | `AverageTaskDuration` | > 600 seconds (recommended alarm) |
 | Manual processing time reduction | ≥ 50% | Measured externally | — |
