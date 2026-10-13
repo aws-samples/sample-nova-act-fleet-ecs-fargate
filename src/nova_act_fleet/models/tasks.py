@@ -61,6 +61,9 @@ class TaskResult(BaseModel):
     output: Optional[Any] = None
     error_details: Optional[List[ErrorDetail]] = None
     screenshot_keys: List[str] = Field(default_factory=list)
+    trace_keys: List[str] = Field(default_factory=list)
+    """S3 keys of the Nova Act SDK per-step session trace (HTML and JSON with
+    embedded step screenshots) uploaded for this task."""
     page_url: Optional[str] = None
     retry_count: int = 0
 

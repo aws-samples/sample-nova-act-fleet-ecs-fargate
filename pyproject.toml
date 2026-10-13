@@ -7,7 +7,7 @@ name = "nova-act-fleet"
 version = "0.2.0"
 description = "Reference implementation for Amazon Nova Act browser-automation fleets on Amazon ECS Fargate, without Amazon Bedrock AgentCore Browser."
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 license = {text = "MIT-0"}
 
 dependencies = [

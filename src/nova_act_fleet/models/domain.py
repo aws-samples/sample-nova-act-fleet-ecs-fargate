@@ -75,6 +75,7 @@ class CheckoutResult(BaseModel):
     total_steps: int
     step_results: List[StepResult]
     final_screenshot_key: Optional[str] = None
+    trace_keys: List[str] = Field(default_factory=list)
 
 
 class QATestStep(BaseModel):
@@ -128,6 +129,7 @@ class QATestReport(BaseModel):
     failed_steps: int
     duration_seconds: float
     step_reports: List[QAStepReport]
+    trace_keys: List[str] = Field(default_factory=list)
 
 
 class LogEvent(BaseModel):

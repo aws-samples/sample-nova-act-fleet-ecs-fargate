@@ -40,7 +40,7 @@ If AgentCore Browser fits your environment, **use it instead** of this project. 
 | Best for | Long-running flows, sustained throughput, GPU-free Chromium workloads, on-demand bursts via `RunTask` | Genuinely bursty, sub-15-minute, event-driven | Most teams that don't have specific reasons to build it themselves |
 | Worst for | Tiny, very-bursty workloads with significant idle (NAT cost dominates) | Multi-page flows beyond 15 min; sustained high throughput | Custom networking, data-residency, region constraints |
 | Out-of-the-box session isolation | Per-task container | Per-invocation container (cold start each time) | Native, by design |
-| Out-of-the-box replay | None (use S3 screenshots + SDK local log) | None (same) | Native, with live view |
+| Out-of-the-box replay | No live view; after-the-fact replay from the SDK session trace and screenshots uploaded to S3 | None (same) | Native, with live view |
 | Status in v0.2 | Shipped, deployable end-to-end | Deferred (see above) | Out of scope by design |
 
 ## Cost guidance

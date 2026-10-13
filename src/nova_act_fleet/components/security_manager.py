@@ -1,10 +1,22 @@
 """SecurityManager for Nova Act Fleet.
 
-Enforces the six-layer defense-in-depth security architecture:
-input filtering, domain restrictions, tool registration,
-file access control, VPC isolation, and IAM permissions.
+Implements the application-side layers of the defense-in-depth model:
+
+1. Input filtering        -- ``filter_prompt`` (called before every session
+                              and every step prompt).
+2. Domain restrictions    -- ``validate_domain`` (pre-flight on the starting
+                              URL, and on every observed URL during a session
+                              through the Nova Act SDK ``state_guardrail``).
+3. Tool surface           -- no custom tools are registered with the Nova Act
+                              SDK; ``registered_tools`` is an opt-in allowlist.
+4. File access control    -- ``validate_file_access`` / ``allowed_file_paths``
+                              (enforced by the SDK through ``SecurityOptions``).
+
+Layers 5 (VPC isolation) and 6 (least-privilege IAM) are enforced by
+``templates/ecs_deployment.yaml``, not by this module.
 """
 
+import os
 import re
 from typing import Dict, List
 from urllib.parse import urlparse
@@ -14,11 +26,11 @@ from nova_act_fleet.models.domain import PromptFilterResult
 
 
 class SecurityManager:
-    """Enforces defense-in-depth security controls.
+    """Enforces the application-side security controls.
 
-    Applies input filtering, domain validation, tool registration,
-    file access control, and least-privilege IAM policy generation
-    based on the provided SecurityConfig.
+    Applies input filtering, domain validation, and file access control,
+    and exposes a starter IAM policy helper for non-CloudFormation
+    deployments, based on the provided SecurityConfig.
     """
 
     def __init__(self, config: SecurityConfig) -> None:
@@ -75,21 +87,43 @@ class SecurityManager:
         return False
 
     def validate_file_access(self, path: str) -> bool:
-        """Validate whether file access is permitted.
+        """Validate whether the browser may open or upload ``path``.
 
-        Returns False by default when file_access_enabled is False,
-        blocking all file system access from browser sessions.
+        Returns False whenever ``file_access_enabled`` is False (the
+        default). When enabled, the resolved path must equal, or sit under,
+        one of ``allowed_file_paths``.
 
         Args:
             path: The file path to validate.
 
         Returns:
-            False when file_access_enabled is False, True otherwise.
+            True only if file access is enabled and ``path`` is allowlisted.
         """
-        return self._config.file_access_enabled
+        if not self._config.file_access_enabled:
+            return False
+        candidate = os.path.realpath(path)
+        for allowed in self._config.allowed_file_paths:
+            root = os.path.realpath(allowed)
+            if candidate == root or candidate.startswith(root.rstrip(os.sep) + os.sep):
+                return True
+        return False
+
+    def allowed_file_paths(self) -> List[str]:
+        """Return the file paths to pass to the Nova Act SDK ``SecurityOptions``.
+
+        Returns an empty list (all file access blocked) unless
+        ``file_access_enabled`` is True.
+        """
+        if not self._config.file_access_enabled:
+            return []
+        return list(self._config.allowed_file_paths)
 
     def get_registered_tools(self) -> List[str]:
-        """Return the configured list of registered tools.
+        """Return the opt-in allowlist of custom tool names.
+
+        The framework itself registers no custom tools with the Nova Act
+        SDK. Adopters that add tools should check each one against this
+        list before passing it to ``NovaAct(tools=...)``.
 
         Returns:
             List of explicitly approved tool names.

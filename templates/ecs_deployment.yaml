@@ -42,7 +42,6 @@ Parameters:
       ECR repository is created with ImageTagMutability=IMMUTABLE, a tag can
       only be pushed once. Bump this value on each deploy (v1, v2, or a git
       short SHA).
-    Description: Docker image tag to deploy for the workflow agent container.
 
   DesiredTaskCount:
     Type: Number
@@ -76,6 +75,19 @@ Parameters:
     Description: >
       Evaluation window (in seconds) for the TaskSuccessRate alarm.
       Must be a multiple of 60. Default 900 = 15 minutes.
+
+Rules:
+  # Amazon Nova Act is available only in US East (N. Virginia) (us-east-1).
+  # If this stack is deployed to another Region, the AWS resources land there
+  # while the Nova Act SDK still calls its implicit us-east-1 endpoint, so the
+  # workload fails at runtime. Fail fast at stack creation with a clear message
+  # instead of deploying a stack that cannot work.
+  RegionMustBeUsEast1:
+    Assertions:
+      - Assert: !Equals [!Ref 'AWS::Region', 'us-east-1']
+        AssertDescription: >-
+          This stack must be deployed in us-east-1 (US East, N. Virginia).
+          Amazon Nova Act is available only in that Region.
 
 Conditions:
   CreateHITLEmailSubscription: !Not [!Equals [!Ref HITLNotificationEmail, '']]
@@ -433,24 +445,22 @@ Resources:
                 Resource:
                   - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/${EnvironmentName}-workflow-agent:*'
 
-              # S3 - read/write execution artifacts
-              - Sid: S3ArtifactAccess
+              # S3 - write execution artifacts (screenshots, extracted data,
+              # error reports). The application only calls PutObject, so
+              # GetObject and ListBucket are intentionally omitted for least
+              # privilege. PutObject needs the object-level ARN (/*) only.
+              - Sid: S3ArtifactWrite
                 Effect: Allow
                 Action:
                   - s3:PutObject
-                  - s3:GetObject
-                  - s3:ListBucket
                 Resource:
-                  - !Sub 'arn:${AWS::Partition}:s3:::${S3ArtifactBucketName}'
                   - !Sub 'arn:${AWS::Partition}:s3:::${S3ArtifactBucketName}/*'
 
-              # Secrets Manager - retrieve Nova Act API key at runtime
-              - Sid: SecretsManagerAccess
-                Effect: Allow
-                Action:
-                  - secretsmanager:GetSecretValue
-                Resource:
-                  - !Ref NovaActApiKeySecretArn
+              # NOTE: The task role intentionally has NO secretsmanager:GetSecretValue.
+              # The Nova Act API key is injected as an environment variable by the
+              # ECS agent via the EXECUTION role's Secrets Manager grant and the
+              # ContainerDefinitions.Secrets block. The running container never
+              # calls Secrets Manager itself, so granting it here would be unused.
 
               # CloudWatch Metrics - publish custom metrics
               - Sid: CloudWatchMetrics

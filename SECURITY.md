@@ -57,8 +57,10 @@ The shipped AWS CloudFormation template (`templates/ecs_deployment.yaml`) provis
 - Amazon Elastic Container Service cluster with Container Insights, an ECS service, and an AWS Fargate task definition
   (4 vCPU / 8 GB).
 - Amazon Elastic Container Registry repository (image scanning on push enabled).
-- IAM execution role and task role, each scoped to the named log group, secret, Amazon S3 bucket, the `NovaActFleet`
-  CloudWatch metric namespace, and the HITL SNS topic.
+- IAM task execution role (image pull from the stack's ECR repository, log writes to the task log group, and
+  `secretsmanager:GetSecretValue` on the named secret) and task role (log writes to the task log group,
+  `s3:PutObject` on the artifact bucket, `cloudwatch:PutMetricData` conditioned on the `NovaActFleet` namespace, and
+  `sns:Publish` on the HITL topic). The task role has no Secrets Manager permission.
 - Security group with egress restricted to HTTPS on port 443 only.
 - Amazon CloudWatch log group with 90-day retention, custom metrics under the `NovaActFleet` namespace, and a
   `TaskSuccessRate-Low` alarm wired to the HITL SNS topic.
@@ -66,6 +68,32 @@ The shipped AWS CloudFormation template (`templates/ecs_deployment.yaml`) provis
 
 The template does not create the Amazon S3 artifact bucket or the AWS Secrets Manager secret; the operator provisions
 both and controls their encryption, bucket policy, and rotation configuration.
+
+The template's `Rules` section fails stack creation outside `us-east-1`, and the container entry point exits with an
+error if `AWS_REGION` or `AWS_DEFAULT_REGION` names another Region.
+
+## Security Controls: What Is Enforced Where
+
+Every `WorkflowAgent` method opens its Nova Act session through one factory, so the controls below apply on every
+code path (`execute_task`, `extract_data`, `automate_form`, `run_checkout_flow`, `run_qa_test`).
+
+| Layer | Control | Where it is enforced | Default |
+|---|---|---|---|
+| 1 | Prompt length and input filtering | `SecurityManager.filter_prompt`, before any session opens, on every prompt or step prompt | On, with conservative `DEFAULT_INPUT_FILTER_PATTERNS` |
+| 2 | Domain allowlist and blocklist | Starting URL before the session opens; every observed URL during the session through the Nova Act SDK `state_guardrail` | On (`AgentConfig.enforce_domains_during_session=True`) |
+| 3 | Tool surface | No custom tools are registered with the Nova Act SDK. `SecurityConfig.registered_tools` is an opt-in allowlist for adopters who add tools | No custom tools |
+| 4 | File access | Nova Act SDK `SecurityOptions` (`allowed_file_open_paths`, `allowed_file_upload_paths`) | All `file://` access and uploads blocked |
+| 5 | Network isolation | CloudFormation: private subnet, no public IP, security group egress TCP 443 only | On |
+| 6 | Least-privilege IAM | CloudFormation: separate, resource-scoped task execution role and task role | On |
+
+Limits of these controls:
+
+- Input filtering is a pattern-based tripwire for obviously malicious task prompts. It does not inspect page content
+  and is not a complete defense against prompt injection.
+- The in-session domain guardrail constrains *where* the browser can go. It does not constrain what the agent types
+  or clicks on an allowlisted page. Keep the allowlist to the hosts the workflow needs.
+- Domain matching is exact hostname. A workflow that redirects through a host you did not list (for example, a
+  single sign-on provider) is stopped with `DomainGuardrailBlocked`; add that host to `allowed_domains`.
 
 ## Accepted Security Debt
 
@@ -203,17 +231,17 @@ environment and layer additional controls where required.
 
   A future change that scopes these branches natively — for example, by accepting an optional set of ARNs on
   `SecurityManager.get_iam_policy()` — would close the debt in code rather than in commentary.
-- **Bandit `B110` (Try, Except, Pass) fires 11 times in
-  `src/nova_act_fleet/components/workflow_agent.py`.** Every site guards a best-effort metadata capture —
-  post-step screenshot upload, page-URL read, or CloudWatch log event emission — where a failure must not
-  propagate into the task's result state. Two sites (post-execution screenshot capture and log-event emission)
-  carry an inline rationale comment; the remaining nine follow an identical pattern in which the target
-  variable is typed `Optional[str]` and initialized to `None` before the `try`, so the intent is clear from
-  the surrounding shape rather than a per-site comment. None of the eleven sites swallows a real error path.
-  The pattern is retained deliberately: propagating a screenshot-service or log-ingestion hiccup up into a
-  running Nova Act task would surface as a task failure that misrepresents what actually went wrong. Adopters
-  extending this pattern to new sites should either add an inline rationale comment, narrow the exception
-  type, or attach a `# nosec B110` marker with justification to keep future scans easy to review.
+- **Best-effort artifact capture.** Screenshot capture, session-trace upload, page-URL reads, and structured log
+  emission must not fail a running task, so `WorkflowAgent._best_effort` catches their exceptions. It does not discard
+  them: each failure is written to the process logger (container stderr, which the `awslogs` driver ships to the task
+  log group). A failed trace upload also leaves the trace on local disk. Bandit reports no `B110` findings in
+  `src/`. A missing screenshot therefore means "capture failed, see the log", not "the step did not run".
+- **Screenshots and session traces can contain sensitive page content.** With `capture_screenshots=True` (the
+  default), every captured page and the Nova Act SDK session trace (which embeds a screenshot per step and the
+  agent's reasoning text) are written to the artifact bucket under `nova-act-artifacts/`. Adopters automating pages
+  that show personal, financial, or health data should either set `CAPTURE_SCREENSHOTS=false` in the task definition,
+  or encrypt the bucket with a customer-managed AWS KMS key, block public access, and apply a lifecycle rule that
+  matches their retention policy. The template does not create or configure the bucket.
 - **The HITL Amazon SNS topic is encrypted with the AWS-managed KMS key for SNS (`alias/aws/sns`), not a
   customer-managed CMK.** HITL messages carry the task prompt, which may reference internal URLs or business context.
   Adopters that require a customer-managed CMK should replace `KmsMasterKeyId` in the template with their CMK ARN and
@@ -224,10 +252,11 @@ environment and layer additional controls where required.
 - **Nova Act API key lifecycle in the task.** The Nova Act API key is loaded from AWS Secrets Manager and injected into
   the Fargate task as an environment variable at task start. The value is present in the task environment for the
   lifetime of the task. Rotate the secret on the schedule your compliance regime requires.
-- **Task payload size ceiling.** `aws ecs run-task --overrides` caps container overrides at 8,192 bytes. Larger task
-  payloads must be routed through Amazon SNS, Amazon SQS, Amazon S3, or Amazon DynamoDB and dereferenced from inside
-  the container. The reference pattern does not implement this dereference path; adopters shipping large payloads
-  should add it.
+- **Task payload size ceilings.** `aws ecs run-task --overrides` caps container overrides at 8,192 bytes, and
+  `FleetConfig.max_payload_size_bytes` rejects any single task larger than 5 MB. The entry point reads only inline
+  JSON from `TASK_PAYLOAD` or stdin; it does not fetch payloads from Amazon S3, Amazon SQS, or Amazon DynamoDB.
+  Adopters shipping larger payloads must resolve them in the caller, or add a dereference step to the entry point
+  (which also needs a matching read permission on the task role).
 - **VPC Flow Logs are not enabled on the shipped Amazon VPC** (cdk-nag `AwsSolutions-VPC7`). The reference pattern
   runs a single private subnet whose security group allows only HTTPS egress, which limits the blast radius of
   suspicious traffic but leaves no network-level audit trail. Adopters extending the pattern to more complex traffic
@@ -287,16 +316,24 @@ environment and layer additional controls where required.
 
 ## Compliance
 
-This pattern is a reference implementation and is **not currently eligible for HIPAA** and is **not certified for
-PCI DSS**. Amazon Nova Act inherits Amazon Bedrock SOC 2 coverage. See the
-[AWS Compliance Programs](https://aws.amazon.com/compliance/programs/) page for the current list of programs and
-services in scope.
+Amazon Nova Act is a **HIPAA Eligible Service** (included in the HIPAA Eligible Services Reference list); processing
+ePHI requires a signed AWS BAA, a HIPAA-designated account, and customer-configured controls (IAM, AWS KMS
+encryption, AWS CloudTrail) under the AWS Shared Responsibility Model. Amazon Nova Act inherits Amazon Bedrock SOC 2
+coverage. For PCI DSS and other programs, confirm current status on the
+[AWS Services in Scope by Compliance Program](https://aws.amazon.com/compliance/services-in-scope/) page. This is a
+reference implementation, not legal or compliance advice.
+
+Service eligibility is not implementation readiness. **This reference implementation is not HIPAA-ready as
+shipped.** Before processing ePHI, close the items under **Accepted Security Debt** that apply to your workload, at
+minimum: customer-managed AWS KMS keys for the log group, SNS topic, ECR repository, and artifact bucket; VPC Flow
+Logs; an AWS CloudTrail trail; a multi-AZ network if your availability requirements demand it; and a decision on
+screenshot and session-trace capture.
 
 ## Dependencies
 
 Runtime dependencies (see `pyproject.toml` and `Dockerfile`):
 
-- Python 3.12 in the container image; Python 3.8+ for development.
+- Python 3.12 in the container image; Python 3.10+ for development.
 - `nova-act`, `boto3`, `pydantic>=2.0`, `python-dotenv`.
 - Playwright with Chromium (baked into the container image).
 
@@ -306,9 +343,10 @@ of their own CI before promoting to production.
 ## Secret Scanning Baseline
 
 The repository ships a `.secrets.baseline` at the root, generated by
-[`detect-secrets`](https://github.com/Yelp/detect-secrets). The baseline records four known false positives (three
-placeholder API-key strings in examples and tests, one substring match on the IAM action `secretsmanager:GetSecretValue`),
-each marked `is_secret: false`. Adopters extending the code should re-audit with
+[`detect-secrets`](https://github.com/Yelp/detect-secrets). The baseline records four known false positives (two
+placeholder API-key strings in a script and a test, and two substring matches on the IAM action
+`secretsmanager:GetSecretValue` in the template), each marked `is_secret: false`. A third placeholder key in
+`tests/unit/test_security_controls.py` carries an inline `pragma: allowlist secret` marker. Adopters extending the code should re-audit with
 `detect-secrets scan --baseline .secrets.baseline` before committing; new hits appear in the baseline diff and must be
 reviewed. This is the same file [Automated Security Helper](https://github.com/awslabs/automated-security-helper) reads
 by default, so re-running ASH does not re-flag the recorded false positives.
