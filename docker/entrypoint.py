@@ -20,7 +20,36 @@ Two payload shapes are supported:
         "input_data":      {...}         # optional
       }
 
-  Batch (FleetOrchestrator path)::
+  Multi-step checkout flow (one browser session, one screenshot per step)::
+
+      {
+        "task_id":           "...",
+        "task_type":         "checkout_flow",
+        "starting_url":      "https://...",
+        "allowed_domains":   ["..."],
+        "blocked_domains":   ["..."],     # optional
+        "step_wait_seconds": 2.0,          # optional
+        "steps": [
+          {"step_name": "cart_review", "prompt": "..."},
+          ...
+        ]
+      }
+
+  Multi-step QA test (one browser session, one screenshot per step)::
+
+      {
+        "task_id":         "...",
+        "task_type":       "qa_test",
+        "test_name":       "...",          # optional, defaults to task_id
+        "starting_url":    "https://...",
+        "allowed_domains": ["..."],
+        "steps": [
+          {"action_prompt": "...", "expected_outcome": "..."},
+          ...
+        ]
+      }
+
+  Batch (FleetOrchestrator path, single-prompt tasks only)::
 
       {
         "tasks": [ {single-task-payload...}, ... ],
@@ -30,8 +59,20 @@ Two payload shapes are supported:
       }
 
 The single-task path uses ``WorkflowAgent.execute_task`` and prints a
-``TaskResult`` JSON. The batch path uses ``FleetOrchestrator.submit_batch``
-and prints a ``BatchResult`` JSON containing all per-task results.
+``TaskResult`` JSON. The ``checkout_flow`` and ``qa_test`` paths use
+``WorkflowAgent.run_checkout_flow`` / ``run_qa_test`` and print a
+``CheckoutResult`` / ``QATestReport`` JSON. The batch path uses
+``FleetOrchestrator.submit_batch`` and prints a ``BatchResult`` JSON
+containing all per-task results.
+
+Every path uploads screenshots to ``nova-act-artifacts/screenshots/<task_id>/``
+and the Nova Act SDK per-step session trace to
+``nova-act-artifacts/traces/<task_id>/`` in ``S3_ARTIFACT_BUCKET``. Set
+``CAPTURE_SCREENSHOTS=false`` to disable both.
+
+The entry point refuses to start when ``AWS_REGION`` or ``AWS_DEFAULT_REGION``
+names a Region other than ``us-east-1``: Amazon Nova Act is available only in
+US East (N. Virginia), and the SDK always calls its us-east-1 endpoint.
 
 Environment contract (set by the ECS task definition or `aws ecs run-task`
 overrides):
@@ -43,6 +84,11 @@ overrides):
   - SNS_TOPIC_ARN      — Optional. When set, HITL escalations for
                          retry-exhausted tasks are published to this
                          topic (only meaningful for batch payloads).
+  - CAPTURE_SCREENSHOTS — Optional, default ``true``. ``false`` disables
+                         screenshot and session-trace upload.
+  - CLOUDWATCH_LOG_GROUP — Optional. Defaults to
+                         ``/ecs/<ENVIRONMENT>-workflow-agent``, the log group
+                         the shipped template creates.
 
 Exit codes:
   0  — Work was attempted. Inspect the printed JSON for per-task status.
@@ -54,18 +100,28 @@ import os
 import sys
 from typing import Any, Dict, List
 
+from pydantic import ValidationError
+
 from nova_act_fleet.agent import (
     AgentConfig,
+    AgentSessionError,
+    CheckoutFlowDefinition,
+    CheckoutStep,
     DeploymentPattern,
     FleetConfig,
     FleetOrchestrator,
     HITLConfig,
     HITLManager,
     ObservabilityConfig,
+    QATestDefinition,
+    QATestStep,
     TaskDefinition,
     WorkflowAgent,
 )
 from nova_act_fleet.components.observability_manager import ObservabilityManager
+
+NOVA_ACT_REGION = "us-east-1"
+MULTI_STEP_TASK_TYPES = ("checkout_flow", "qa_test")
 
 
 def _read_payload() -> Dict[str, Any]:
@@ -110,6 +166,25 @@ def _union_domains(tasks: List[Dict[str, Any]]) -> List[str]:
     return seen
 
 
+def _check_region() -> None:
+    """Fail fast when the container is configured for another Region."""
+    for env in ("AWS_REGION", "AWS_DEFAULT_REGION"):
+        region = os.environ.get(env, "").strip()
+        if region and region != NOVA_ACT_REGION:
+            raise ValueError(
+                f"{env}={region!r}, but Amazon Nova Act is available only in "
+                f"{NOVA_ACT_REGION} (US East, N. Virginia). Deploy the stack and run the container in "
+                f"{NOVA_ACT_REGION}."
+            )
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw not in ("0", "false", "no", "off")
+
+
 def _make_observability(environment: str, s3_bucket: str) -> ObservabilityManager:
     log_group = os.environ.get(
         "CLOUDWATCH_LOG_GROUP", f"/ecs/{environment}-workflow-agent"
@@ -118,33 +193,92 @@ def _make_observability(environment: str, s3_bucket: str) -> ObservabilityManage
         ObservabilityConfig(
             cloudwatch_log_group=log_group,
             s3_bucket=s3_bucket,
+            capture_screenshots=_env_flag("CAPTURE_SCREENSHOTS", True),
+            # The shipped template creates the log group, so the task role
+            # does not need logs:CreateLogGroup.
+            create_log_group=False,
         )
     )
 
 
+def _make_agent(
+    payload: Dict[str, Any], api_key: str, environment: str, s3_bucket: str
+) -> WorkflowAgent:
+    agent_config = AgentConfig(
+        starting_url=payload["starting_url"],
+        api_key=api_key,
+        allowed_domains=payload["allowed_domains"],
+        blocked_domains=payload.get("blocked_domains", []),
+        headless=True,
+    )
+    return WorkflowAgent(
+        config=agent_config,
+        observability_manager=_make_observability(environment, s3_bucket),
+    )
+
+
+def _build_checkout_flow(payload: Dict[str, Any]) -> CheckoutFlowDefinition:
+    return CheckoutFlowDefinition(
+        flow_id=payload["task_id"],
+        starting_url=payload["starting_url"],
+        step_wait_seconds=payload.get("step_wait_seconds", 2.0),
+        steps=[
+            CheckoutStep(
+                step_index=step.get("step_index", index),
+                step_name=step.get("step_name", f"step_{index}"),
+                prompt=step["prompt"],
+                expected_url_pattern=step.get("expected_url_pattern"),
+            )
+            for index, step in enumerate(payload["steps"])
+        ],
+    )
+
+
+def _build_qa_test(payload: Dict[str, Any]) -> QATestDefinition:
+    return QATestDefinition(
+        test_id=payload["task_id"],
+        test_name=payload.get("test_name", payload["task_id"]),
+        starting_url=payload["starting_url"],
+        steps=[
+            QATestStep(
+                step_index=step.get("step_index", index),
+                action_prompt=step["action_prompt"],
+                expected_outcome=step["expected_outcome"],
+            )
+            for index, step in enumerate(payload["steps"])
+        ],
+    )
+
+
 def _run_single(payload: Dict[str, Any], api_key: str, environment: str, s3_bucket: str) -> int:
+    task_type = payload.get("task_type", "custom")
     try:
-        agent_config = AgentConfig(
-            starting_url=payload["starting_url"],
-            api_key=api_key,
-            allowed_domains=payload["allowed_domains"],
-            blocked_domains=payload.get("blocked_domains", []),
-            headless=True,
-        )
+        agent = _make_agent(payload, api_key, environment, s3_bucket)
+        if task_type == "checkout_flow":
+            flow = _build_checkout_flow(payload)
+        elif task_type == "qa_test":
+            qa_test = _build_qa_test(payload)
+        else:
+            task = _build_task(payload)
     except KeyError as exc:
         print(f"ERROR: missing required payload field {exc}", file=sys.stderr)
         return 1
-
-    observability = _make_observability(environment, s3_bucket)
-    agent = WorkflowAgent(config=agent_config, observability_manager=observability)
-
-    try:
-        task = _build_task(payload)
-    except KeyError as exc:
-        print(f"ERROR: missing required task field {exc}", file=sys.stderr)
+    except (TypeError, ValidationError) as exc:
+        print(f"ERROR: invalid payload: {exc}", file=sys.stderr)
         return 1
 
-    result = agent.execute_task(task)
+    try:
+        if task_type == "checkout_flow":
+            result = agent.run_checkout_flow(flow)
+        elif task_type == "qa_test":
+            result = agent.run_qa_test(qa_test)
+        else:
+            result = agent.execute_task(task)
+    except AgentSessionError as exc:
+        # Pre-flight rejection (prompt filter, domain check) or SDK missing.
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
     print(result.model_dump_json())
     return 0
 
@@ -210,6 +344,7 @@ def _run_batch(payload: Dict[str, Any], api_key: str, environment: str, s3_bucke
 
 def main() -> int:
     try:
+        _check_region()
         payload = _read_payload()
         api_key = _require("NOVA_ACT_API_KEY")
         s3_bucket = _require("S3_ARTIFACT_BUCKET")
@@ -220,6 +355,13 @@ def main() -> int:
     environment = os.environ.get("ENVIRONMENT", "nova-act").strip() or "nova-act"
 
     if "tasks" in payload:
+        if any(t.get("task_type") in MULTI_STEP_TASK_TYPES for t in payload.get("tasks") or []):
+            print(
+                "ERROR: batch payloads support single-prompt tasks only; submit "
+                "checkout_flow and qa_test payloads as individual tasks.",
+                file=sys.stderr,
+            )
+            return 1
         return _run_batch(payload, api_key, environment, s3_bucket)
     return _run_single(payload, api_key, environment, s3_bucket)
 
